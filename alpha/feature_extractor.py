@@ -1,45 +1,68 @@
 """
-Feature Extractor
+Feature Extraction
 """
+
+from math import fabs
 
 
 class FeatureExtractor:
 
     @staticmethod
-    def extract(pair, atm):
+    def extract(pair, spot):
 
         ce = pair["ce"]
         pe = pair["pe"]
 
-        ce_bid = ce["top_bid_price"]
-        ce_ask = ce["top_ask_price"]
+        ce_strike = pair["ce_strike"]
+        pe_strike = pair["pe_strike"]
 
-        pe_bid = pe["top_bid_price"]
-        pe_ask = pe["top_ask_price"]
-
-        ce_ltp = max(ce["last_price"], 0.01)
-        pe_ltp = max(pe["last_price"], 0.01)
-
-        ce_spread = ce_ask - ce_bid
-        pe_spread = pe_ask - pe_bid
-
-        ce_spread_pct = ce_spread / ce_ltp
-        pe_spread_pct = pe_spread / pe_ltp
+        ce_spread = ce["top_ask_price"] - ce["top_bid_price"]
+        pe_spread = pe["top_ask_price"] - pe["top_bid_price"]
 
         return {
 
-            "ce_volume": ce["volume"],
-            "pe_volume": pe["volume"],
+            "ce_strike": ce_strike,
+            "pe_strike": pe_strike,
+
+            "distance_ce": fabs(spot - ce_strike),
+            "distance_pe": fabs(spot - pe_strike),
 
             "ce_oi": ce["oi"],
             "pe_oi": pe["oi"],
 
+            "min_oi": min(
+                ce["oi"],
+                pe["oi"],
+            ),
+
+            "ce_volume": ce["volume"],
+            "pe_volume": pe["volume"],
+
+            "min_volume": min(
+                ce["volume"],
+                pe["volume"],
+            ),
+
+            "ce_spread": ce_spread,
+            "pe_spread": pe_spread,
+
+            "total_spread": ce_spread + pe_spread,
+
+            "ce_price": ce["last_price"],
+            "pe_price": pe["last_price"],
+
             "ce_iv": ce["implied_volatility"],
             "pe_iv": pe["implied_volatility"],
 
-            "ce_spread": ce_spread_pct,
-            "pe_spread": pe_spread_pct,
+            "ce_delta": ce["greeks"]["delta"],
+            "pe_delta": pe["greeks"]["delta"],
 
-            "ce_distance": abs(pair["ce_strike"] - atm),
-            "pe_distance": abs(pair["pe_strike"] - atm),
+            "ce_gamma": ce["greeks"]["gamma"],
+            "pe_gamma": pe["greeks"]["gamma"],
+
+            "ce_theta": ce["greeks"]["theta"],
+            "pe_theta": pe["greeks"]["theta"],
+
+            "ce_vega": ce["greeks"]["vega"],
+            "pe_vega": pe["greeks"]["vega"],
         }
