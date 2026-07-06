@@ -1,48 +1,32 @@
 """
 Pair Selector
-"""
 
-from alpha.pair_filter import PairFilter
-from alpha.pair_scorer import PairScorer
+Responsible for selecting the best candidate
+from the ranked list.
+
+No scoring.
+
+No filtering.
+
+No ranking.
+
+Those responsibilities belong to
+other modules.
+"""
 
 
 class PairSelector:
 
-    def __init__(self):
+    @staticmethod
+    def select(ranked_pairs):
 
-        self.filter = PairFilter()
-        self.scorer = PairScorer()
+        if not ranked_pairs:
 
-    def select(self, pairs):
+            return None
 
-        ranked = []
+        return ranked_pairs[0]
 
-        rejected = 0
+    @staticmethod
+    def top(ranked_pairs, count=10):
 
-        for pair in pairs:
-
-            ce = pair["ce"]
-            pe = pair["pe"]
-
-            if not self.filter.is_valid(ce, pe):
-
-                rejected += 1
-                continue
-
-            ranked.append({
-
-                "ce": pair["ce_strike"],
-                "pe": pair["pe_strike"],
-                "score": self.scorer.score(
-                    ce,
-                    pe
-                )
-
-            })
-
-        ranked.sort(
-            key=lambda x: x["score"],
-            reverse=True
-        )
-
-        return ranked, rejected
+        return ranked_pairs[:count]
