@@ -1,5 +1,5 @@
 {
-  "total_capital": 30000.0,
+  "total_capital": 45000.0,
   "nifty_lot_size": 65,
   "pair_scan_range": 10,
   "candle_interval_minutes": 2,
@@ -22,9 +22,9 @@
   "preclose_entry_cutoff": "15:10",
   "health_check_api_latency_ms": 500,
   "health_check_spread_max": 1.5,
-  "health_check_cache_stale_sec": 1,
-  "execution_mode": "BACKTEST",
+  "health_check_cache_stale_sec": 10,
+  "execution_mode": "PAPER",
   "scan_interval_seconds": 120,
-  "backtest_from_date": "2026-07-01",
-  "backtest_to_date": "2026-07-10"
+  "backtest_from_date": "2026-06-08",
+  "backtest_to_date": "2026-07-12"
 }

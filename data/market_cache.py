@@ -23,6 +23,9 @@ class MarketCache:
         # greeks: { strike: { "CE": {delta, gamma, vega, theta}, "PE": {...} } }
         self._greeks: Dict[int, Dict[str, Dict[str, float]]] = {}
         
+        # security IDs mapping: { (strike, option_type): security_id }
+        self._security_ids: Dict[tuple[int, str], int] = {}
+        
         # iv info
         self._atm_iv: float = 0.15
         self._iv_percentile: float = 50.0  # 0 to 100
@@ -55,6 +58,14 @@ class MarketCache:
         with self._lock:
             if strike not in self._option_chain:
                 self._option_chain[strike] = {}
+            
+            # Ensure "open" is initialized to prevent calculation failures in velocity/divergence
+            existing = self._option_chain[strike].get(option_type)
+            if existing and existing.get("open", 0.0) > 0.0:
+                data["open"] = existing["open"]
+            elif data.get("open", 0.0) <= 0.0:
+                data["open"] = data.get("last", 0.0)
+
             self._option_chain[strike][option_type] = data
             self._last_update = datetime.now()
 
@@ -110,10 +121,19 @@ class MarketCache:
         with self._lock:
             return self._last_update, self._api_latency_ms
 
+    def set_security_id(self, strike: int, option_type: str, security_id: int) -> None:
+        with self._lock:
+            self._security_ids[(strike, option_type)] = security_id
+
+    def get_security_id(self, strike: int, option_type: str) -> Optional[int]:
+        with self._lock:
+            return self._security_ids.get((strike, option_type))
+
     def clear(self) -> None:
         with self._lock:
             self._option_chain.clear()
             self._greeks.clear()
+            self._security_ids.clear()
             self._spot_price = 0.0
             self._spot_timestamp = None
             self._atm_strike = 0

@@ -83,9 +83,30 @@ class DhanClient:
         """Fetch open positions from broker."""
         try:
             resp = self.client.get_positions()
-            if resp.get("status") == "success":
+            if isinstance(resp, dict) and resp.get("status") == "success":
                 return resp.get("data", [])
             return []
         except Exception as e:
             logger.error(f"Failed to fetch live positions: {e}")
             return []
+
+    def validate_credentials(self) -> bool:
+        """
+        Runs a pre-flight query to verify Dhan API credentials.
+        Raises ValueError if authentication fails.
+        """
+        try:
+            resp = self.client.get_positions()
+            if isinstance(resp, dict) and resp.get("status") == "failure":
+                remarks = resp.get("remarks", {})
+                error_msg = remarks.get("error_message", "Unknown error")
+                error_type = remarks.get("error_type", "")
+                if "Authentication" in error_type or "access token" in error_msg.lower():
+                    raise ValueError(f"Dhan Access Token expired or invalid: {error_msg}")
+            elif isinstance(resp, str) and "Invalid_Authentication" in resp:
+                raise ValueError("Dhan Access Token expired or invalid.")
+            return True
+        except Exception as e:
+            if "Authentication" in str(e) or "Access Token" in str(e):
+                raise
+            raise ValueError(f"Pre-flight authentication check failed: {e}")

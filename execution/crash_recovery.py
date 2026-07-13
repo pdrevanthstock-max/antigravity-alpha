@@ -149,3 +149,23 @@ class CrashRecovery:
             exit_reason=ExitReason(data["exit_reason"]) if data["exit_reason"] else None
         )
         return trade
+
+    def save_engine_status(self, running: bool) -> None:
+        try:
+            status_file = self.filepath.parent / "engine_status.json"
+            with open(status_file, "w", encoding="utf-8") as f:
+                json.dump({"running": running}, f)
+            logger.debug(f"CrashRecovery: Saved running status: {running}")
+        except Exception as e:
+            logger.error(f"CrashRecovery: Failed to save running status: {e}")
+
+    def load_engine_status(self) -> bool:
+        try:
+            status_file = self.filepath.parent / "engine_status.json"
+            if status_file.exists():
+                with open(status_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                return data.get("running", False)
+            return False
+        except Exception:
+            return False

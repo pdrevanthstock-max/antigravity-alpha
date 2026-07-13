@@ -24,7 +24,7 @@ DHAN_ACCESS_TOKEN: str = os.getenv("DHAN_ACCESS_TOKEN", "")
 @dataclass
 class TradingConfig:
     # Capital
-    total_capital: float = 30000.0
+    total_capital: float = 45000.0
 
     # Option specs
     nifty_lot_size: int = 65
@@ -67,7 +67,7 @@ class TradingConfig:
     # Health Checks
     health_check_api_latency_ms: int = 500
     health_check_spread_max: float = 1.50
-    health_check_cache_stale_sec: int = 1
+    health_check_cache_stale_sec: int = 10
 
     # App controls
     execution_mode: str = "BACKTEST"  # BACKTEST | PAPER | LIVE

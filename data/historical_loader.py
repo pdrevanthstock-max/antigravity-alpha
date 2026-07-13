@@ -43,9 +43,18 @@ class HistoricalLoader:
             strikes.append(f"ITM{i}")
             strikes.append(f"OTM{i}")
 
+        self.fallback_engaged = False
         use_offline_cache = False
-        if not DHAN_ACCESS_TOKEN or len(DHAN_ACCESS_TOKEN) < 10:
-            logger.info("DHAN_ACCESS_TOKEN is missing or invalid. Using offline cache fallback.")
+
+        # Pre-flight token check
+        if DHAN_ACCESS_TOKEN and len(DHAN_ACCESS_TOKEN) >= 10:
+            try:
+                self.client.validate_credentials()
+            except Exception as auth_err:
+                logger.error(f"Pre-flight authentication check failed: {auth_err}")
+                use_offline_cache = True
+        else:
+            logger.error("DHAN_ACCESS_TOKEN is missing or invalid. Forcing offline cache fallback.")
             use_offline_cache = True
 
         if not use_offline_cache:
@@ -71,9 +80,16 @@ class HistoricalLoader:
                         strike, op_type = futures[future]
                         try:
                             raw = future.result()
-                            # Check if the API returned an authentication error
-                            if isinstance(raw, dict) and raw.get("status") == "failure" and "Authentication" in raw.get("remarks", {}).get("error_message", ""):
-                                raise ValueError("Invalid access token returned by API.")
+                            # Check if the API returned an authentication error or invalid string response
+                            if not isinstance(raw, dict):
+                                raise ValueError(f"Dhan API returned non-JSON/string response (auth error or rate limit): {raw}")
+                            if raw.get("status") == "failure":
+                                remarks = raw.get("remarks", {})
+                                err_msg = remarks.get("error_message", "Unknown error")
+                                err_type = remarks.get("error_type", "")
+                                if "Authentication" in err_type or "access token" in err_msg.lower() or "Invalid_Authentication" in err_msg:
+                                    raise ValueError(f"Dhan auth failed — check access token. Error: {err_msg}")
+                            
                             df = self._parse_raw_df(raw, strike, op_type, interval_minutes)
                             if not df.empty:
                                 results[(strike, op_type)] = df
@@ -82,16 +98,19 @@ class HistoricalLoader:
                                 logger.warning(f"No candles parsed for {strike} {op_type}")
                         except Exception as e:
                             logger.error(f"Error fetching data for {strike} {op_type}: {e}")
+                            if "auth failed" in str(e) or "authentication" in str(e).lower() or "access token" in str(e).lower():
+                                raise
 
                 if not results:
                     raise InsufficientDataError(f"No historical data returned for range {from_date} to {to_date}")
                 
                 return self._align_and_group(results, strikes)
             except Exception as e:
-                logger.warning(f"Dhan API fetch failed ({e}). Falling back to offline cache...")
+                logger.error(f"Dhan API fetch failed ({e}). ENGAGING OFFLINE CACHE FALLBACK. Reduced scope: ATM-only strike pairs instead of full matrix scan!")
                 use_offline_cache = True
 
         if use_offline_cache:
+            self.fallback_engaged = True
             cache_file = PROJECT_ROOT / "cache" / "cache_06883e782d7c16e4.json"
             if cache_file.exists():
                 logger.info(f"Loading from offline cache file: {cache_file}")

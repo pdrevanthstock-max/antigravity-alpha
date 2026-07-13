@@ -36,8 +36,8 @@ class HealthMonitor:
             cpu_usage = 10.0
             memory_usage = 45.0
 
-        if cpu_usage > 70.0:
-            return False, f"CPU usage too high: {cpu_usage:.1f}% > 70%"
+        if cpu_usage > 90.0:
+            return False, f"CPU usage too high: {cpu_usage:.1f}% > 90%"
 
         if memory_usage > 95.0:
             return False, f"Memory usage too high: {memory_usage:.1f}% > 95%"

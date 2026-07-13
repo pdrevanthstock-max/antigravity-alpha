@@ -35,6 +35,16 @@ class PairRanker:
 
             ce_price = ce_data.get("last", ce_data.get("close", 0.0))
             pe_price = pe_data.get("last", pe_data.get("close", 0.0))
+            
+            # Premium similarity check (maximum 10% difference as requested by user)
+            if ce_price <= 0.0 or pe_price <= 0.0:
+                continue
+            
+            avg_price = (ce_price + pe_price) / 2.0
+            price_diff_pct = abs(ce_price - pe_price) / avg_price
+            if price_diff_pct > 0.10:
+                continue
+
             combined_premium = ce_price + pe_price
 
             # Estimate combined expected move

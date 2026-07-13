@@ -169,16 +169,18 @@ class BrokerExecutor:
         order_type: str = "MARKET",
         limit_price: Optional[float] = None
     ) -> Dict[str, Any]:
-        # Structurally correct Dhan order payload format
+        # Retrieve security ID from MarketCache
+        sec_id = market_cache.get_security_id(int(strike), "CE" if option_type in ("CALL", "CE") else "PE")
+        if not sec_id:
+            raise ValueError(f"BrokerExecutor: Security ID mapping missing in MarketCache for {strike} {option_type}.")
+
         payload = {
-            "transactionType": direction,
-            "exchangeSegment": "NSE_FNO",
-            "instrument": "OPTIDX",
-            "strike": strike,
-            "optionType": option_type,
-            "quantity": qty,
-            "orderType": "LIMIT" if limit_price is not None else "MARKET",
+            "security_id": str(sec_id),
+            "exchange_segment": "NSE_FNO",
+            "transaction_type": "BUY" if direction == "BUY" else "SELL",
+            "quantity": int(qty),
+            "order_type": "LIMIT" if limit_price is not None else "MARKET",
+            "product_type": "MARGIN",
+            "price": float(limit_price or 0.0)
         }
-        if limit_price is not None:
-            payload["price"] = limit_price
         return payload

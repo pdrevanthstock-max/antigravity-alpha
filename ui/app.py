@@ -1,5 +1,6 @@
 import os
 import sys
+import importlib
 import logging
 import time
 import threading
@@ -29,6 +30,8 @@ from strategy.pair_candidate_generator import PairCandidateGenerator
 from strategy.liquidity_filter import LiquidityFilter
 from strategy.divergence_scanner import DivergenceScanner
 from strategy.entry_signal import EntrySignal
+import strategy.pair_ranker
+importlib.reload(strategy.pair_ranker)
 from strategy.pair_ranker import PairRanker
 from strategy.regime_detector import RegimeDetector
 from strategy.trade_planner import TradePlanner
@@ -45,6 +48,8 @@ from execution.execution_validator import ExecutionValidator
 from execution.execution_queue import ExecutionQueue
 from execution.paper_executor import PaperExecutor
 from execution.broker_executor import BrokerExecutor
+import execution.crash_recovery
+importlib.reload(execution.crash_recovery)
 from execution.crash_recovery import CrashRecovery
 
 # Setup basic logging
@@ -106,6 +111,10 @@ class LiveEngine:
         self.thread: Optional[threading.Thread] = None
         self.config = TradingConfig.load()
         
+        # Thread-safe activity log list
+        self._log_lock = threading.Lock()
+        self.activity_log: List[str] = []
+        
         # Strategy components
         self.generator = PairCandidateGenerator()
         self.liq_filter = LiquidityFilter()
@@ -142,28 +151,90 @@ class LiveEngine:
         self.vwap_values = []
         self.atr_values = []
 
+    def log_activity(self, message: str) -> None:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        formatted = f"[{ts}] {message}"
+        with self._log_lock:
+            self.activity_log.append(formatted)
+            if len(self.activity_log) > 200:
+                self.activity_log.pop(0)
+
     def start(self) -> None:
         if self.running:
             return
+            
+        # Re-instantiate all strategy modules to pick up disk code modifications on startup
+        self.generator = PairCandidateGenerator()
+        self.liq_filter = LiquidityFilter()
+        self.scanner = DivergenceScanner()
+        self.entry_signal = EntrySignal()
+        self.ranker = PairRanker()
+        self.regime_detector = RegimeDetector()
+        self.planner = TradePlanner()
+        self.pos_guard = PositionGuard()
+        self.circuit_breaker = DailyCircuitBreaker()
+        self.sizer = PositionSizer()
+        self.order_selector = OrderTypeSelector()
+        self.exit_manager = ExitManager()
+        self.hedge_cut_manager = HedgeCutManager()
+        self.single_leg_exit_manager = SingleLegExitManager()
+        self.rotation_engine = RotationEngine()
+        
+        with self._log_lock:
+            self.activity_log.clear()
+            
+        self.log_activity("Clearing stale market cache data...")
+        from data.market_cache import market_cache
+        market_cache.clear()
+
+        self.log_activity("Initializing pre-flight credentials checks...")
+        
+        # Pre-flight token validation for live/paper modes
+        if self.config.execution_mode in [ExecutionMode.PAPER.value, ExecutionMode.LIVE.value]:
+            from data.dhan_client import DhanClient
+            client = DhanClient()
+            try:
+                client.validate_credentials()
+                self.log_activity("Pre-flight credentials check successful.")
+            except Exception as auth_err:
+                self.log_activity(f"Pre-flight authentication check failed: {auth_err}")
+                logger.error(f"Pre-flight authentication check failed: {auth_err}")
+                raise ValueError(f"Dhan Authentication Failed. Please check access token in .env. Details: {auth_err}")
+
         self.running = True
+        self.recovery.save_engine_status(True)
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
+        self.log_activity(f"LiveEngine background thread loop started in {self.config.execution_mode} mode.")
         logger.info("LiveEngine started background thread loop.")
 
     def stop(self) -> None:
         self.running = False
+        self.recovery.save_engine_status(False)
         if self.thread:
             self.thread.join(timeout=2.0)
+        
+        self.log_activity("Clearing market cache data...")
+        from data.market_cache import market_cache
+        market_cache.clear()
+
+        self.log_activity("LiveEngine stopped background thread loop.")
         logger.info("LiveEngine stopped background thread loop.")
 
     def _loop(self) -> None:
+        self.log_activity("Running recovery state load...")
         # Load state from crash recovery
         self.realized_pnl, self.active_trade = self.recovery.load_state()
+        if self.active_trade:
+            self.log_activity(f"Crash Recovery: Recovered active trade {self.active_trade.id} ({self.active_trade.phase.value})")
+        else:
+            self.log_activity("Crash Recovery: No active open trade found.")
         
         # Start Live Feed & Queue worker
         from data.live_feed import LiveFeed
         self.feed = LiveFeed()
         self.feed.start()
+        self.log_activity("Live WebSocket feed feed initialized (MOCKED).")
         
         self.queue.clear()
         self.queue.start_background_worker(self._execute_signal)
@@ -174,6 +245,7 @@ class LiveEngine:
                 self._run_strategy_cycle()
                 time.sleep(5)  # strategy evaluates every 5 seconds
             except Exception as e:
+                self.log_activity(f"Error in LiveEngine cycle: {e}")
                 logger.error(f"Error in LiveEngine background iteration: {e}")
                 time.sleep(5)
 
@@ -196,7 +268,8 @@ class LiveEngine:
         from data.market_cache import market_cache
         spot_price, _ = market_cache.get_spot()
         if spot_price <= 0.0:
-            return  # cache not populated by feed yet
+            self.log_activity("Waiting for spot price cache update...")
+            return
             
         atm_strike = market_cache.get_atm_strike()
 
@@ -223,18 +296,43 @@ class LiveEngine:
             atm_strike=atm_strike
         )
 
-        breaker_hit = self.circuit_breaker.is_breaker_triggered(self.realized_pnl, self.config)
+        # Check daily circuit breaker using combined realized PnL + active trade unrealized PnL
+        current_total_pnl = self.realized_pnl
+        if self.active_trade and self.active_trade.is_open:
+            current_total_pnl += self.active_trade.combined_pnl
+            
+        breaker_hit = self.circuit_breaker.is_breaker_triggered(current_total_pnl, self.config)
 
         if self.active_trade and self.active_trade.is_open:
             ce_data = market_cache.get_option(self.active_trade.strike_ce, "CE")
             pe_data = market_cache.get_option(self.active_trade.strike_pe, "PE")
             
             if ce_data and pe_data:
+                self.active_trade.ce_current_price = ce_data["last"]
+                self.active_trade.pe_current_price = pe_data["last"]
+                
+                # Save updated live prices and PnL to SQLite database & recovery state
+                self.store.save_trade(self.active_trade)
+                self.recovery.save_state(self.realized_pnl, self.active_trade)
+                
                 ce_p = ce_data["last"]
                 pe_p = pe_data["last"]
                 
+                self.log_activity(f"Active Position holding: {self.active_trade.id} ({self.active_trade.phase.value}). Combined PnL: ₹{self.active_trade.combined_pnl:.2f}")
+                
+                # Check circuit breaker hit dynamically during active trade (protect 3% capital)
+                if breaker_hit:
+                    self.log_activity("Daily loss limit breached by active trade unrealized loss. Enqueuing emergency exit!")
+                    self.queue.enqueue(ExecutionSignal(
+                        type=SignalType.EXIT_BOTH,
+                        trade_id=self.active_trade.id,
+                        reason="CIRCUIT_BREAKER_TRIGGERED"
+                    ))
+                    return
+
                 # Check EOD flatten
                 if current_time_only >= datetime_time(end_hour, end_min):
+                    self.log_activity("EOD close cutoff reached. Enqueuing exit.")
                     self.queue.enqueue(ExecutionSignal(
                         type=SignalType.EXIT_BOTH,
                         trade_id=self.active_trade.id,
@@ -251,6 +349,7 @@ class LiveEngine:
                             config=self.config
                         )
                         if exit_res:
+                            self.log_activity(f"Exit trigger: {exit_res.value}. Enqueuing exit.")
                             self.queue.enqueue(ExecutionSignal(
                                 type=SignalType.EXIT_BOTH,
                                 trade_id=self.active_trade.id,
@@ -259,6 +358,7 @@ class LiveEngine:
                         else:
                             if self.active_trade.regime_at_entry == MarketRegime.DIRECTIONAL:
                                 if self.hedge_cut_manager.should_hedge_cut(self.active_trade, ce_p, pe_p, self.config):
+                                    self.log_activity("Losing leg breach. Enqueuing hedge cut.")
                                     self.queue.enqueue(ExecutionSignal(
                                         type=SignalType.HEDGE_CUT,
                                         trade_id=self.active_trade.id
@@ -276,6 +376,7 @@ class LiveEngine:
                             config=self.config
                         )
                         if exit_res:
+                            self.log_activity(f"Single leg trailing exit: {exit_res.value}. Enqueuing exit.")
                             self.queue.enqueue(ExecutionSignal(
                                 type=SignalType.EXIT_BOTH,
                                 trade_id=self.active_trade.id,
@@ -285,51 +386,108 @@ class LiveEngine:
                             if regime == MarketRegime.SIDEWAYS:
                                 self._check_rotation_live(regime, ce_p, pe_p)
         else:
+            # Reconcile open positions with broker to catch orphan positions in LIVE mode
+            if self.config.execution_mode == ExecutionMode.LIVE.value:
+                try:
+                    positions = self.broker_executor.client.get_positions()
+                    active_positions = [p for p in positions if int(p.get("netQty", 0)) != 0]
+                    if active_positions:
+                        self.log_activity(f"Reconciliation Alert: Found {len(active_positions)} open positions at broker with no active trade. Squaring off!")
+                        for pos in active_positions:
+                            qty = abs(int(pos.get("netQty", 0)))
+                            direction = "SELL" if int(pos.get("netQty", 0)) > 0 else "BUY"
+                            details = {
+                                "security_id": str(pos.get("securityId")),
+                                "exchange_segment": pos.get("exchangeSegment", "NSE_FNO"),
+                                "transaction_type": direction,
+                                "quantity": qty,
+                                "order_type": "MARKET",
+                                "product_type": "MARGIN",
+                                "price": 0.0
+                            }
+                            # Send order directly to client place_order
+                            self.broker_executor.client.place_order(details)
+                            self.log_activity(f"Reconciliation: Closed position {pos.get('tradingSymbol')} at broker.")
+                except Exception as recon_err:
+                    logger.error(f"Broker position reconciliation check failed: {recon_err}")
+
             # Check entry conditions
-            if trading_hours and not last_entry_passed and not breaker_hit:
-                healthy, _ = self.health_monitor.check_health(self.config)
-                if healthy:
-                    candidates = self.generator.generate_candidates()
-                    ce_strikes = [c[0] for c in candidates]
-                    pe_strikes = [c[1] for c in candidates]
-                    
-                    filtered_ce = self.liq_filter.filter_strikes(ce_strikes, "CE", self.config)
-                    filtered_pe = self.liq_filter.filter_strikes(pe_strikes, "PE", self.config)
-                    
-                    filtered_candidates = []
-                    for ce in filtered_ce:
-                        for pe in filtered_pe:
-                            filtered_candidates.append((ce, pe))
-                            
-                    scanned = self.scanner.scan_candidates(filtered_candidates)
-                    survivors = self.entry_signal.evaluate_signals(scanned, regime, spot_trend, self.config)
-                    top_candidate = self.ranker.rank_candidates(survivors, self.config)
-                    
-                    if top_candidate:
-                        ce_data = market_cache.get_option(top_candidate.ce_strike, "CE")
-                        pe_data = market_cache.get_option(top_candidate.pe_strike, "PE")
-                        if ce_data and pe_data:
-                            qty = self.sizer.calculate_lots(ce_data["last"], pe_data["last"], self.config)
-                            if qty > 0:
-                                plan = self.planner.plan_trade(
-                                    candidate=top_candidate,
-                                    regime=regime,
-                                    quantity=qty,
-                                    ce_price=ce_data["last"],
-                                    pe_price=pe_data["last"],
-                                    config=self.config
-                                )
-                                is_valid, _ = self.validator.validate_entry(
-                                    plan=plan,
-                                    realized_pnl=self.realized_pnl,
-                                    active_trade=self.active_trade,
-                                    config=self.config
-                                )
-                                if is_valid:
-                                    self.queue.enqueue(ExecutionSignal(
-                                        type=SignalType.ENTRY,
-                                        trade_plan=plan
-                                    ))
+            if not trading_hours:
+                self.log_activity(f"Outside trading hours (09:30-15:20). Current: {now.strftime('%H:%M:%S')}")
+                return
+            if last_entry_passed:
+                self.log_activity(f"Last entry time passed. Entries disabled.")
+                return
+            if breaker_hit:
+                self.log_activity("Daily Circuit Breaker is active. Entries blocked.")
+                return
+
+            self.log_activity(f"Scanning market. Spot: {spot_price:.2f} | ATM Strike: {atm_strike} | Regime: {regime.value} ({spot_trend})")
+            healthy, health_msg = self.health_monitor.check_health(self.config)
+            if not healthy:
+                self.log_activity(f"Health check failed: {health_msg}. Skipping scan.")
+                return
+
+            candidates = self.generator.generate_candidates()
+            if not candidates:
+                self.log_activity("No candidates generated (empty option chain).")
+                return
+            # De-duplicate strikes before running liquidity filter (CPU and matrix sizing optimization)
+            ce_strikes = list(set(c[0] for c in candidates))
+            pe_strikes = list(set(c[1] for c in candidates))
+            
+            filtered_ce = self.liq_filter.filter_strikes(ce_strikes, "CE", self.config)
+            filtered_pe = self.liq_filter.filter_strikes(pe_strikes, "PE", self.config)
+            
+            filtered_candidates = []
+            for ce in filtered_ce:
+                for pe in filtered_pe:
+                    filtered_candidates.append((ce, pe))
+            
+            self.log_activity(f"Liquidity Filter: {len(filtered_candidates)} of {len(candidates)} pairs passed pre-Cartesian check.")
+            if not filtered_candidates:
+                return
+                
+            scanned = self.scanner.scan_candidates(filtered_candidates)
+            survivors = self.entry_signal.evaluate_signals(scanned, regime, spot_trend, self.config)
+            self.log_activity(f"Divergence check: {len(survivors)} of {len(scanned)} pairs passed entry criteria.")
+            
+            top_candidate = self.ranker.rank_candidates(survivors, self.config)
+            
+            if top_candidate:
+                self.log_activity(f"Top Candidate selected: {top_candidate.ce_strike}CE-{top_candidate.pe_strike}PE (Divergence: {top_candidate.divergence:.2f}%)")
+                ce_data = market_cache.get_option(top_candidate.ce_strike, "CE")
+                pe_data = market_cache.get_option(top_candidate.pe_strike, "PE")
+                if ce_data and pe_data:
+                    qty = self.sizer.calculate_lots(ce_data["last"], pe_data["last"], self.config)
+                    if qty > 0:
+                        plan = self.planner.plan_trade(
+                            candidate=top_candidate,
+                            regime=regime,
+                            quantity=qty,
+                            ce_price=ce_data["last"],
+                            pe_price=pe_data["last"],
+                            config=self.config
+                        )
+                        is_valid, reason = self.validator.validate_entry(
+                            plan=plan,
+                            realized_pnl=self.realized_pnl,
+                            active_trade=self.active_trade,
+                            config=self.config
+                        )
+                        if is_valid:
+                            self.log_activity(f"Validation successful. Enqueuing entry signal for {qty} lots.")
+                            self.queue.enqueue(ExecutionSignal(
+                                type=SignalType.ENTRY,
+                                trade_plan=plan
+                            ))
+                        else:
+                            self.log_activity(f"Entry validation failed: {reason}")
+                    else:
+                        required_prem = (ce_data["last"] + pe_data["last"]) * self.config.nifty_lot_size
+                        self.log_activity(f"Sizer returned 0 lots (Required: ₹{required_prem:.2f}, Capital: ₹{self.config.total_capital:.2f})")
+            else:
+                self.log_activity("No scanned pairs met entry signals.")
 
     def _check_rotation_live(self, regime: MarketRegime, ce_p: float, pe_p: float) -> None:
         candidates = self.generator.generate_candidates()
@@ -378,6 +536,7 @@ class LiveEngine:
 
         if signal.type == SignalType.ENTRY:
             plan = signal.trade_plan
+            self.log_activity(f"Executing ENTRY order for {plan.scored_candidate.ce_strike}CE / {plan.scored_candidate.pe_strike}PE ({plan.quantity} lots)...")
             if is_live:
                 loop = asyncio.new_event_loop()
                 trade = loop.run_until_complete(self.broker_executor.execute_entry(plan, now))
@@ -389,10 +548,12 @@ class LiveEngine:
             self.store.save_trade(trade)
             self.recovery.save_state(self.realized_pnl, trade)
             self.decision_memory.log_entry(trade.id, plan)
+            self.log_activity(f"ENTRY SUCCESS: Position active (ID: {trade.id}). CE: ₹{trade.entry_ce_price:.2f}, PE: ₹{trade.entry_pe_price:.2f}")
 
         elif signal.type == SignalType.EXIT_BOTH:
             if self.active_trade and self.active_trade.is_open:
                 reason = ExitReason(signal.reason or "MANUAL")
+                self.log_activity(f"Executing EXIT order for {self.active_trade.id} (Reason: {reason.value})...")
                 if is_live:
                     loop = asyncio.new_event_loop()
                     loop.run_until_complete(self.broker_executor.execute_exit_both(self.active_trade, now, reason))
@@ -404,10 +565,12 @@ class LiveEngine:
                 self.store.save_trade(self.active_trade)
                 self.recovery.save_state(self.realized_pnl, None)
                 self.decision_memory.log_exit(self.active_trade.id, self.active_trade, reason.value)
+                self.log_activity(f"EXIT SUCCESS: Position closed. Combined PnL: ₹{self.active_trade.combined_pnl:.2f}. Total Session PnL: ₹{self.realized_pnl:.2f}")
                 self.active_trade = None
 
         elif signal.type == SignalType.HEDGE_CUT:
             if self.active_trade and self.active_trade.phase == TradePhase.PHASE_1_BOTH_LEGS:
+                self.log_activity(f"Executing HEDGE CUT order for losing leg of {self.active_trade.id}...")
                 if is_live:
                     loop = asyncio.new_event_loop()
                     loop.run_until_complete(self.broker_executor.execute_hedge_cut(self.active_trade, now))
@@ -423,10 +586,12 @@ class LiveEngine:
                     self.active_trade.losing_leg_exit_price,
                     self.active_trade.losing_leg_pnl
                 )
+                self.log_activity(f"HEDGE CUT SUCCESS: Losing leg ({self.active_trade.losing_leg}) cut at ₹{self.active_trade.losing_leg_exit_price:.2f}. Realized loss: ₹{self.active_trade.losing_leg_pnl:.2f}")
 
         elif signal.type == SignalType.ROTATION:
             if self.active_trade and self.active_trade.is_open:
                 # Close current
+                self.log_activity(f"Executing ROTATION close for {self.active_trade.id}...")
                 if is_live:
                     loop = asyncio.new_event_loop()
                     loop.run_until_complete(self.broker_executor.execute_exit_both(self.active_trade, now, ExitReason.ROTATION))
@@ -440,10 +605,12 @@ class LiveEngine:
 
                 old_id = self.active_trade.id
                 old_pnl = self.active_trade.combined_pnl
+                self.log_activity(f"ROTATION CLOSE SUCCESS: Trade {old_id} closed at PnL ₹{old_pnl:.2f}.")
                 self.active_trade = None
 
                 # Enter new
                 plan = signal.trade_plan
+                self.log_activity(f"Executing ROTATION entry for {plan.scored_candidate.ce_strike}CE / {plan.scored_candidate.pe_strike}PE ({plan.quantity} lots)...")
                 if is_live:
                     loop = asyncio.new_event_loop()
                     trade = loop.run_until_complete(self.broker_executor.execute_entry(plan, now))
@@ -456,6 +623,7 @@ class LiveEngine:
                 self.recovery.save_state(self.realized_pnl, trade)
                 self.decision_memory.log_rotation(old_id, old_pnl, plan, signal.reason or "Better score")
                 self.decision_memory.log_entry(trade.id, plan)
+                self.log_activity(f"ROTATION ENTRY SUCCESS: Position active (ID: {trade.id}). CE: ₹{trade.entry_ce_price:.2f}, PE: ₹{trade.entry_pe_price:.2f}")
 
 def main():
     # Load config
@@ -466,6 +634,14 @@ def main():
     # Initialize Singleton LiveEngine in st.session_state
     if "live_engine" not in st.session_state:
         st.session_state["live_engine"] = LiveEngine()
+        # Recover running state from disk to survive page refreshes
+        engine_inst = st.session_state["live_engine"]
+        was_running = engine_inst.recovery.load_engine_status()
+        if was_running and not engine_inst.running:
+            try:
+                engine_inst.start()
+            except Exception as e:
+                logger.error(f"Auto-recovery start failed on refresh: {e}")
     engine_inst = st.session_state["live_engine"]
 
     # Title Banner
@@ -497,9 +673,12 @@ def main():
         col_start, col_stop = st.sidebar.columns(2)
         with col_start:
             if st.button("▶️ Start Engine", disabled=engine_inst.running, use_container_width=True):
-                engine_inst.start()
-                st.toast("AutoTrader Live/Paper Engine started successfully!", icon="🟢")
-                st.rerun()
+                try:
+                    engine_inst.start()
+                    st.toast("AutoTrader Live/Paper Engine started successfully!", icon="🟢")
+                    st.rerun()
+                except Exception as e:
+                    st.sidebar.error(f"Failed to start: {e}")
         with col_stop:
             if st.button("⏹️ Stop Engine", disabled=not engine_inst.running, use_container_width=True):
                 engine_inst.stop()
@@ -508,6 +687,40 @@ def main():
 
         status_text = "🟢 RUNNING" if engine_inst.running else "🛑 STOPPED"
         st.sidebar.markdown(f"Status: **{status_text}**")
+
+        st.sidebar.write("")
+        if st.sidebar.button("🧹 Reset Active Position & State", use_container_width=True):
+            if engine_inst.running:
+                engine_inst.stop()
+            
+            # Emergency exit square-off of active trade if open
+            if engine_inst.active_trade and engine_inst.active_trade.is_open:
+                st.toast("Triggering emergency square-off exit orders...", icon="🚨")
+                try:
+                    now = datetime.now()
+                    if config.execution_mode == ExecutionMode.LIVE.value:
+                        import asyncio
+                        loop = asyncio.new_event_loop()
+                        loop.run_until_complete(engine_inst.broker_executor.execute_exit_both(engine_inst.active_trade, now, ExitReason.MANUAL))
+                        loop.close()
+                    else:
+                        engine_inst.paper_executor.execute_exit_both(engine_inst.active_trade, now, ExitReason.MANUAL)
+                except Exception as square_err:
+                    st.sidebar.error(f"Emergency square-off failed: {square_err}")
+                
+                # Update DB record with closed manual status
+                engine_inst.active_trade.phase = TradePhase.CLOSED
+                engine_inst.active_trade.exit_time = datetime.now()
+                engine_inst.active_trade.exit_reason = ExitReason.MANUAL
+                engine_inst.store.save_trade(engine_inst.active_trade)
+            
+            engine_inst.realized_pnl = 0.0
+            engine_inst.active_trade = None
+            engine_inst.recovery.save_state(0.0, None)
+            from data.market_cache import market_cache
+            market_cache.clear()
+            st.toast("Active position, recovery state, and Cache wiped cleanly.", icon="🧹")
+            st.rerun()
     else:
         st.sidebar.markdown("Status: **N/A (Backtest Mode)**")
 
@@ -586,7 +799,11 @@ def main():
     )
 
     # Main Tabs
-    tab_bt, tab_live, tab_hist = st.tabs(["📉 Backtest Engine", "🟢 Live Monitoring", "📜 Trade Journal"])
+    tab_bt, tab_live, tab_hist = st.tabs([
+        "📉 Backtest Engine (Backtest Mode Only)", 
+        "🟢 Live Monitoring (Paper / Live Mode)", 
+        "📜 Trade Journal (All Modes)"
+    ])
 
     # -------------------------------------------------------------
     # TAB 1: BACKTESTER
@@ -595,11 +812,17 @@ def main():
         st.subheader("Historical Simulation Replay")
         st.write("Replay historical tick data through the divergence matrix scanner to compute profitability.")
 
+        # Observability banner for offline cache fallback
+        if st.session_state.get("fallback_engaged", False):
+            st.error("⚠️ ENGAGED OFFLINE CACHE FALLBACK: Live Nifty option chain fetch failed (invalid access token or rate limit). The system has automatically loaded from the offline cache, reducing the matrix scan scope to ATM-only strike pairs.")
+
         col_run, col_status = st.columns([1, 4])
         with col_run:
             run_btn = st.button("🚀 Run Backtest", use_container_width=True)
 
         if run_btn:
+            # Clear previous fallback state
+            st.session_state["fallback_engaged"] = False
             try:
                 with st.spinner("Fetching option chain candles..."):
                     loader = HistoricalLoader()
@@ -609,6 +832,9 @@ def main():
                         scan_range=config.pair_scan_range,
                         interval_minutes=config.candle_interval_minutes
                     )
+                    
+                    if getattr(loader, "fallback_engaged", False):
+                        st.session_state["fallback_engaged"] = True
                 
                 with st.spinner("Replaying historical days..."):
                     engine = BacktestEngine(config)
@@ -676,11 +902,37 @@ def main():
         st.subheader("Live Operational View")
         
         # Display currently-held pair
-        active_trades = [t for t in store.get_all_trades() if t.is_open]
+        active_trade = engine_inst.active_trade
         
-        if active_trades:
-            active_trade = active_trades[-1]
+        # 1. Performance and Daily Session P&L Calculations
+        total_pnl = engine_inst.realized_pnl
+        active_pnl = active_trade.combined_pnl if (active_trade and active_trade.is_open) else 0.0
+        total_day_pnl = total_pnl + active_pnl
+        
+        mc1, mc2, mc3 = st.columns(3)
+        realized_color = "#10b981" if engine_inst.realized_pnl >= 0 else "#ef4444"
+        active_color = "#10b981" if active_pnl >= 0 else "#ef4444"
+        total_color = "#10b981" if total_day_pnl >= 0 else "#ef4444"
+        
+        mc1.markdown(f'<div class="metric-card">Realized P&L<div class="metric-value" style="color: {realized_color};">₹{engine_inst.realized_pnl:,.2f}</div></div>', unsafe_allow_html=True)
+        mc2.markdown(f'<div class="metric-card">Active Position P&L<div class="metric-value" style="color: {active_color};">₹{active_pnl:,.2f}</div></div>', unsafe_allow_html=True)
+        mc3.markdown(f'<div class="metric-card">Total Day P&L<div class="metric-value" style="color: {total_color};">₹{total_day_pnl:,.2f}</div></div>', unsafe_allow_html=True)
+        st.write("")
+
+        if active_trade and active_trade.is_open:
             st.info(f"⚡ Currently holding open position: {active_trade.id}")
+            
+            # Derive order execution status for each leg
+            ce_status = "FILLED"
+            pe_status = "FILLED"
+            if active_trade.phase == TradePhase.PHASE_2_SINGLE_LEG:
+                if active_trade.winning_leg == "CE":
+                    pe_status = "HEDGE CUT (CLOSED)"
+                else:
+                    ce_status = "HEDGE CUT (CLOSED)"
+            elif active_trade.phase == TradePhase.CLOSED:
+                ce_status = "CLOSED"
+                pe_status = "CLOSED"
             
             lc1, lc2, lc3 = st.columns(3)
             with lc1:
@@ -689,6 +941,7 @@ def main():
                     <div style="background: #1e293b; padding: 15px; border-radius: 8px; border: 1px solid #3b82f6;">
                         <h4 style="margin: 0; color: #60a5fa;">CE Leg Status</h4>
                         <p style="margin: 5px 0 0 0; font-size: 1.2rem; font-weight: 700; color: white;">Strike: {active_trade.strike_ce} | Entry: ₹{active_trade.entry_ce_price:.2f}</p>
+                        <p style="margin: 5px 0 0 0; font-size: 0.95rem; color: #94a3b8;">Status: <span style="color: #60a5fa; font-weight: 700;">{ce_status}</span></p>
                     </div>
                     """,
                     unsafe_allow_html=True
@@ -699,17 +952,20 @@ def main():
                     <div style="background: #1e293b; padding: 15px; border-radius: 8px; border: 1px solid #10b981;">
                         <h4 style="margin: 0; color: #34d399;">PE Leg Status</h4>
                         <p style="margin: 5px 0 0 0; font-size: 1.2rem; font-weight: 700; color: white;">Strike: {active_trade.strike_pe} | Entry: ₹{active_trade.entry_pe_price:.2f}</p>
+                        <p style="margin: 5px 0 0 0; font-size: 0.95rem; color: #94a3b8;">Status: <span style="color: #34d399; font-weight: 700;">{pe_status}</span></p>
                     </div>
                     """,
                     unsafe_allow_html=True
                 )
             with lc3:
                 pnl_style = "color: #10b981;" if active_trade.combined_pnl >= 0 else "color: #ef4444;"
+                entry_time_str = active_trade.entry_time.strftime("%H:%M:%S") if active_trade.entry_time else "N/A"
                 st.markdown(
                     f"""
                     <div style="background: #1e293b; padding: 15px; border-radius: 8px; border: 1px solid #fbbf24;">
                         <h4 style="margin: 0; color: #fbbf24;">Position Details</h4>
                         <p style="margin: 5px 0 0 0; font-size: 1.1rem; color: white;">Phase: {active_trade.phase.value} | PnL: <span style="{pnl_style} font-weight:700;">₹{active_trade.combined_pnl:.2f}</span></p>
+                        <p style="margin: 5px 0 0 0; font-size: 0.9rem; color: #94a3b8;">Entry Time: {entry_time_str}</p>
                     </div>
                     """,
                     unsafe_allow_html=True
@@ -717,23 +973,46 @@ def main():
         else:
             st.info("No active open position at this moment.")
 
+        # Live Activity Log Console (newest logs at the top)
+        st.markdown("### 🖥️ Engine Activity Console")
+        st.markdown("<p style='color: #94a3b8; font-size: 0.9rem; margin-top: -10px;'>Real-time strategy pipeline execution logs (newest entries first, auto-refresh active)</p>", unsafe_allow_html=True)
+        log_text = "\n".join(reversed(engine_inst.activity_log)) if engine_inst.activity_log else "Engine not started or no log entries yet."
+        st.text_area("Activity Log", value=log_text, height=350, disabled=True, label_visibility="collapsed")
+
     # -------------------------------------------------------------
     # TAB 3: TRADE JOURNAL
     # -------------------------------------------------------------
     with tab_hist:
         st.subheader("Historical Trade Journal")
+        
+        filter_mode = st.selectbox(
+            "Filter Journal by Execution Mode",
+            options=["All Modes", "Backtest Mode Only (June 2026)", "Paper / Live Mode Only"],
+            index=0
+        )
+        
         all_trades = store.get_all_trades()
         
-        if all_trades:
+        # Filter trades based on date heuristics (June 2026 backtest window vs live/paper runs)
+        if filter_mode == "Backtest Mode Only (June 2026)":
+            trades_to_show = [t for t in all_trades if t.entry_time and t.entry_time.year == 2026 and t.entry_time.month == 6]
+        elif filter_mode == "Paper / Live Mode Only":
+            trades_to_show = [t for t in all_trades if not (t.entry_time and t.entry_time.year == 2026 and t.entry_time.month == 6)]
+        else:
+            trades_to_show = all_trades
+
+        if trades_to_show:
             rows = []
-            for t in all_trades:
+            for t in trades_to_show:
                 rows.append({
                     "Trade ID": t.id,
                     "Direction": t.direction.value,
                     "CE Strike": t.strike_ce,
                     "PE Strike": t.strike_pe,
+                    "Entry Time": t.entry_time.strftime("%m-%d %H:%M:%S") if t.entry_time else "N/A",
                     "CE Entry": t.entry_ce_price,
                     "PE Entry": t.entry_pe_price,
+                    "Combined Entry (₹)": round(t.entry_ce_price + t.entry_pe_price, 2),
                     "Regime": t.regime_at_entry.value,
                     "Phase": t.phase.value,
                     "Hedge-Cut Time": t.hedge_cut_time.strftime("%H:%M:%S") if t.hedge_cut_time else "N/A",
@@ -749,7 +1028,12 @@ def main():
             df_hist = pd.DataFrame(rows)
             st.dataframe(df_hist, use_container_width=True)
         else:
-            st.info("No trades saved in SQLite database yet.")
+            st.info("No trades matched the selected filter mode.")
+
+    # Auto-refresh UI when the engine is running to pull latest activity logs
+    if getattr(engine_inst, "running", False):
+        time.sleep(3)
+        st.rerun()
 
 if __name__ == "__main__":
     main()
