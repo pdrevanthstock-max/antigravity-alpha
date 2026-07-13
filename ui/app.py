@@ -55,7 +55,7 @@ from execution.crash_recovery import CrashRecovery
 # Setup basic logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("AutoTrader")
-
+_global_active_engine = None
 st.set_page_config(
     page_title="AutoTrader Dashboard",
     page_icon="📈",
@@ -70,17 +70,27 @@ st.markdown(
         background: #0f172a;
     }
     .metric-card {
-        background-color: #1e293b;
-        border-radius: 12px;
-        padding: 20px;
-        border: 1px solid #334155;
-        box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1);
+        background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
+        border-radius: 14px;
+        padding: 24px;
+        border: 2px solid #475569;
+        box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.3), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
         text-align: center;
+        margin-bottom: 15px;
+    }
+    .metric-title {
+        font-size: 1rem;
+        font-weight: 700;
+        color: #e2e8f0;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        margin-bottom: 10px;
     }
     .metric-value {
-        font-size: 2rem;
-        font-weight: 700;
+        font-size: 2.3rem;
+        font-weight: 800;
         margin-top: 5px;
+        text-shadow: 0 2px 4px rgba(0,0,0,0.4);
     }
     .health-bar {
         background: rgba(30, 41, 59, 0.7);
@@ -631,18 +641,23 @@ def main():
     store = TradeStore()
     monitor = HealthMonitor()
 
-    # Initialize Singleton LiveEngine in st.session_state
-    if "live_engine" not in st.session_state:
-        st.session_state["live_engine"] = LiveEngine()
-        # Recover running state from disk to survive page refreshes
-        engine_inst = st.session_state["live_engine"]
-        was_running = engine_inst.recovery.load_engine_status()
-        if was_running and not engine_inst.running:
-            try:
-                engine_inst.start()
-            except Exception as e:
-                logger.error(f"Auto-recovery start failed on refresh: {e}")
-    engine_inst = st.session_state["live_engine"]
+    # Initialize Singleton LiveEngine using process-level sys persistence and thread locks
+    import sys
+    import threading
+    _init_lock = globals().setdefault("_init_lock", threading.Lock())
+    with _init_lock:
+        if not hasattr(sys, "_global_active_engine") or sys._global_active_engine is None:
+            sys._global_active_engine = LiveEngine()
+            # Recover running state from disk to survive page refreshes (only on fresh server start)
+            was_running = sys._global_active_engine.recovery.load_engine_status()
+            if was_running and not sys._global_active_engine.running:
+                try:
+                    sys._global_active_engine.start()
+                except Exception as e:
+                    logger.error(f"Auto-recovery start failed on fresh server start: {e}")
+                
+    engine_inst = sys._global_active_engine
+    st.session_state["live_engine"] = engine_inst
 
     # Title Banner
     st.markdown(
@@ -863,11 +878,11 @@ def main():
             gross_pnl_color = "#10b981" if metrics["total_pnl"] >= 0 else "#ef4444"
             net_pnl_color = "#10b981" if metrics["total_net_pnl"] >= 0 else "#ef4444"
             
-            c1.markdown(f'<div class="metric-card">Gross P&L<div class="metric-value" style="color: {gross_pnl_color};">₹{metrics["total_pnl"]:,.2f}</div></div>', unsafe_allow_html=True)
-            c2.markdown(f'<div class="metric-card">Transaction Costs<div class="metric-value" style="color: #eab308;">₹{metrics["total_costs"]:,.2f}</div></div>', unsafe_allow_html=True)
-            c3.markdown(f'<div class="metric-card">Net P&L<div class="metric-value" style="color: {net_pnl_color};">₹{metrics["total_net_pnl"]:,.2f}</div></div>', unsafe_allow_html=True)
-            c4.markdown(f'<div class="metric-card">Win Rate<div class="metric-value" style="color: #60a5fa;">{metrics["win_rate"]}%</div></div>', unsafe_allow_html=True)
-            c5.markdown(f'<div class="metric-card">Max Drawdown (Net)<div class="metric-value" style="color: #f87171;">₹{metrics["max_drawdown"]:,.2f}</div></div>', unsafe_allow_html=True)
+            c1.markdown(f'<div class="metric-card"><div class="metric-title">Gross P&L</div><div class="metric-value" style="color: {gross_pnl_color};">₹{metrics["total_pnl"]:,.2f}</div></div>', unsafe_allow_html=True)
+            c2.markdown(f'<div class="metric-card"><div class="metric-title">Transaction Costs</div><div class="metric-value" style="color: #eab308;">₹{metrics["total_costs"]:,.2f}</div></div>', unsafe_allow_html=True)
+            c3.markdown(f'<div class="metric-card"><div class="metric-title">Net P&L</div><div class="metric-value" style="color: {net_pnl_color};">₹{metrics["total_net_pnl"]:,.2f}</div></div>', unsafe_allow_html=True)
+            c4.markdown(f'<div class="metric-card"><div class="metric-title">Win Rate</div><div class="metric-value" style="color: #60a5fa;">{metrics["win_rate"]}%</div></div>', unsafe_allow_html=True)
+            c5.markdown(f'<div class="metric-card"><div class="metric-title">Max Drawdown (Net)</div><div class="metric-value" style="color: #f87171;">₹{metrics["max_drawdown"]:,.2f}</div></div>', unsafe_allow_html=True)
 
             # Equity Curve chart
             st.markdown("### Equity Curve")
@@ -914,9 +929,9 @@ def main():
         active_color = "#10b981" if active_pnl >= 0 else "#ef4444"
         total_color = "#10b981" if total_day_pnl >= 0 else "#ef4444"
         
-        mc1.markdown(f'<div class="metric-card">Realized P&L<div class="metric-value" style="color: {realized_color};">₹{engine_inst.realized_pnl:,.2f}</div></div>', unsafe_allow_html=True)
-        mc2.markdown(f'<div class="metric-card">Active Position P&L<div class="metric-value" style="color: {active_color};">₹{active_pnl:,.2f}</div></div>', unsafe_allow_html=True)
-        mc3.markdown(f'<div class="metric-card">Total Day P&L<div class="metric-value" style="color: {total_color};">₹{total_day_pnl:,.2f}</div></div>', unsafe_allow_html=True)
+        mc1.markdown(f'<div class="metric-card"><div class="metric-title">Realized P&L</div><div class="metric-value" style="color: {realized_color};">₹{engine_inst.realized_pnl:,.2f}</div></div>', unsafe_allow_html=True)
+        mc2.markdown(f'<div class="metric-card"><div class="metric-title">Active Position P&L</div><div class="metric-value" style="color: {active_color};">₹{active_pnl:,.2f}</div></div>', unsafe_allow_html=True)
+        mc3.markdown(f'<div class="metric-card"><div class="metric-title">Total Day P&L</div><div class="metric-value" style="color: {total_color};">₹{total_day_pnl:,.2f}</div></div>', unsafe_allow_html=True)
         st.write("")
 
         if active_trade and active_trade.is_open:
@@ -1007,19 +1022,27 @@ def main():
                 rows.append({
                     "Trade ID": t.id,
                     "Direction": t.direction.value,
-                    "CE Strike": t.strike_ce,
-                    "PE Strike": t.strike_pe,
-                    "Entry Time": t.entry_time.strftime("%m-%d %H:%M:%S") if t.entry_time else "N/A",
+                    "CE Strike": str(t.strike_ce),
+                    "PE Strike": str(t.strike_pe),
+                    "Entry Time": t.entry_time.strftime("%m-%d %H:%M:%S") if t.entry_time else None,
                     "CE Entry": t.entry_ce_price,
                     "PE Entry": t.entry_pe_price,
                     "Combined Entry (₹)": round(t.entry_ce_price + t.entry_pe_price, 2),
                     "Regime": t.regime_at_entry.value,
                     "Phase": t.phase.value,
-                    "Hedge-Cut Time": t.hedge_cut_time.strftime("%H:%M:%S") if t.hedge_cut_time else "N/A",
-                    "CE Exit": t.exit_ce_price if t.exit_ce_price else "N/A",
-                    "PE Exit": t.exit_pe_price if t.exit_pe_price else "N/A",
+                    "Hedge-Cut Time": t.hedge_cut_time.strftime("%H:%M:%S") if t.hedge_cut_time else None,
+                    "CE Exit": t.exit_ce_price if t.exit_ce_price is not None else None,
+                    "PE Exit": t.exit_pe_price if t.exit_pe_price is not None else None,
                     "Exit Time": t.exit_time.strftime("%m-%d %H:%M:%S") if t.exit_time else "OPEN",
-                    "Reason": t.exit_reason.value if t.exit_reason else "N/A",
+                    "Reason": {
+                        "GIVEBACK": "Trailing Stop-Loss (Profit Giveback)",
+                        "TARGET_HIT": "Take-Profit Target Hit",
+                        "ROTATION": "Option Pair Rotation (Strike Switch)",
+                        "HEDGE_CUT": "Hedge Leg Cut",
+                        "EOD_SQUARE_OFF": "End of Day Auto-Exit (15:20)",
+                        "PARTIAL_FILL_ABORT": "Partial Fill Abort",
+                        "MANUAL": "Manual Reset / Emergency Exit"
+                    }.get(t.exit_reason.value, t.exit_reason.value) if t.exit_reason else None,
                     "Gross PnL (₹)": t.combined_pnl,
                     "Transaction Costs (₹)": t.transaction_costs,
                     "Net PnL (₹)": t.net_pnl

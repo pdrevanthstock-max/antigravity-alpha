@@ -153,9 +153,13 @@ class CrashRecovery:
     def save_engine_status(self, running: bool) -> None:
         try:
             status_file = self.filepath.parent / "engine_status.json"
+            data = {
+                "running": running,
+                "last_start_date": datetime.now().strftime("%Y-%m-%d")
+            }
             with open(status_file, "w", encoding="utf-8") as f:
-                json.dump({"running": running}, f)
-            logger.debug(f"CrashRecovery: Saved running status: {running}")
+                json.dump(data, f)
+            logger.debug(f"CrashRecovery: Saved running status: {running} for date {data['last_start_date']}")
         except Exception as e:
             logger.error(f"CrashRecovery: Failed to save running status: {e}")
 
@@ -165,7 +169,26 @@ class CrashRecovery:
             if status_file.exists():
                 with open(status_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                return data.get("running", False)
+                
+                if not data.get("running", False):
+                    return False
+                
+                # 1. Date Check: Only auto-resume if the engine was started today
+                today_str = datetime.now().strftime("%Y-%m-%d")
+                if data.get("last_start_date") != today_str:
+                    logger.info("CrashRecovery: Different trading day detected, resetting status to STOPPED.")
+                    self.save_engine_status(False)
+                    return False
+                
+                # 2. Time Check: Only auto-resume between 09:30 and 15:20 IST
+                from datetime import time as datetime_time
+                current_time_only = datetime.now().time()
+                if current_time_only >= datetime_time(15, 20) or current_time_only < datetime_time(9, 30):
+                    logger.info("CrashRecovery: Outside active trading session hours, resetting status to STOPPED.")
+                    self.save_engine_status(False)
+                    return False
+                
+                return True
             return False
         except Exception:
             return False

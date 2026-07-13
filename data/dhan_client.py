@@ -99,14 +99,22 @@ class DhanClient:
             resp = self.client.get_positions()
             if isinstance(resp, dict) and resp.get("status") == "failure":
                 remarks = resp.get("remarks", {})
-                error_msg = remarks.get("error_message", "Unknown error")
-                error_type = remarks.get("error_type", "")
-                if "Authentication" in error_type or "access token" in error_msg.lower():
+                error_msg = remarks.get("error_message") or "Unknown error"
+                error_type = remarks.get("error_type") or ""
+                
+                # Check for authentication failures
+                if "Authentication" in error_type or "access token" in error_msg.lower() or "authentication" in error_msg.lower():
                     raise ValueError(f"Dhan Access Token expired or invalid: {error_msg}")
+                else:
+                    # Raise a general exception for other failures (e.g. rate limits or connection failures)
+                    raise ValueError(f"Dhan API returned failure status: {error_msg} (type: {error_type})")
             elif isinstance(resp, str) and "Invalid_Authentication" in resp:
                 raise ValueError("Dhan Access Token expired or invalid.")
             return True
         except Exception as e:
-            if "Authentication" in str(e) or "Access Token" in str(e):
+            # Re-raise any ValueError we explicitly raised
+            if isinstance(e, ValueError):
                 raise
-            raise ValueError(f"Pre-flight authentication check failed: {e}")
+            # If it's a generic exception, log it and raise it as an authentication/connection failure
+            logger.error(f"Dhan validation failed with error: {e}")
+            raise ValueError(f"Dhan validation failed: {e}")
